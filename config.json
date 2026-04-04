@@ -1,0 +1,12 @@
+{
+  "account_name": "夜職",
+  "sheet_tab": "",
+  "dedup_tab": "dedup",
+  "genres": [
+    {"name": "夜職", "weight": 100}
+  ],
+  "posts_per_day": 4,
+  "threshold_days": 7,
+  "posts_per_run": 50,
+  "max_hashtags": 3
+}

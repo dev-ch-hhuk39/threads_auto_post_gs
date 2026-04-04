@@ -4,3 +4,4 @@ gspread==6.1.4
 google-auth==2.35.0
 schedule==1.2.1
 tenacity==8.4.2
+google-generativeai>=0.8.0
