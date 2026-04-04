@@ -1,7 +1,7 @@
 {
   "account_name": "夜職",
-  "sheet_tab": "",
-  "dedup_tab": "dedup",
+  "sheet_tab": "auto-posttab",
+  "dedup_tab": "収集投稿",
   "genres": [
     {"name": "夜職", "weight": 100}
   ],
