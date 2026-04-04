@@ -1,5 +1,5 @@
 """
-collect.py - Gemini でコンテンツ生成 → スプシ書き込み
+collect.py - Gemini でコンテンツ生成 → ネタ帳(dedup)保存 + 投稿タブ書き込み
 
 使い方:
   python collect.py --platform threads
@@ -15,12 +15,27 @@ import google.generativeai as genai
 
 JST = timezone(timedelta(hours=9))
 
-# スプシ投稿タブのヘッダー（既存スクリプトと共通）
-SHEET_HEADERS = [
+# 投稿タブのヘッダー（既存スクリプトと共通）
+POST_HEADERS = [
     "text", "image_url", "alt_text", "link_attachment",
     "reply_control", "topic_tag", "location_id",
     "status", "posted_at", "error",
 ]
+
+# ネタ帳(dedup)タブのヘッダー（スプシの列順に合わせる）
+DEDUP_HEADERS = [
+    "id", "created_at", "platform", "genre",
+    "source_account", "source_url", "source_id",
+    "original_text", "media_urls", "media_alt_text",
+    "keywords", "tone_notes", "rewrite_general",
+    "compose_x", "compose_threads",
+    "compose_note_title", "compose_note_body_md",
+    "hashtags", "mentions", "ocr_text", "ocr_json",
+    "status", "scheduled_at", "posted_url", "reviewer", "notes",
+    "reviewed",
+]
+# source_id は DEDUP_HEADERS の7番目（1-indexed = 7）
+DEDUP_SOURCE_ID_COL = 7
 
 # Gemini TSV の投稿文列
 PLATFORM_TEXT_COL = {
@@ -29,7 +44,7 @@ PLATFORM_TEXT_COL = {
 }
 
 
-# ── 設定読み込み ─────────────────────────────────────────────
+# ── 設定読み込み ──────────────────────────────────────────────
 
 def load_config(path="config.json"):
     with open(path, "r", encoding="utf-8") as f:
@@ -40,7 +55,7 @@ def load_prompt(path="prompts/generate.md"):
         return f.read()
 
 
-# ── Google Sheets 接続 ───────────────────────────────────────
+# ── Google Sheets 接続 ────────────────────────────────────────
 
 def _gc_from_env():
     """SA_JSON_BASE64 または GCP_SA_JSON から gspread クライアントを返す"""
@@ -64,12 +79,11 @@ def _gc_from_env():
         )
         return gspread.authorize(creds)
 
-    # ローカル開発用: ~/.config/gspread/service_account.json
-    return gspread.service_account()
+    return gspread.service_account()  # ローカル開発用
 
 
 def open_sheets(config):
-    """投稿タブ と 重複管理タブ を返す"""
+    """投稿タブ と ネタ帳(dedup)タブ を返す"""
     gc = _gc_from_env()
 
     sheet_url = os.environ.get("SHEET_URL", "").strip()
@@ -89,10 +103,10 @@ def open_sheets(config):
     return post_ws, dedup_ws
 
 
-# ── 件数チェック・重複管理 ───────────────────────────────────
+# ── 件数チェック・重複管理 ────────────────────────────────────
 
 def count_pending(ws):
-    """投稿待ち（status が posted / done / 済 以外）の件数を返す"""
+    """投稿待ち件数を返す（status が posted / done / 済 以外）"""
     records = ws.get_all_records(default_blank="")
     return sum(
         1 for r in records
@@ -102,12 +116,13 @@ def count_pending(ws):
     )
 
 def get_used_ids(dedup_ws):
-    """重複管理タブの source_id 一覧を返す"""
-    vals = dedup_ws.col_values(1)
-    return set(v.strip() for v in vals if v.strip())
+    """ネタ帳の source_id 列（7列目）から使用済みID一覧を返す"""
+    vals = dedup_ws.col_values(DEDUP_SOURCE_ID_COL)
+    # 1行目はヘッダー（"source_id"）なのでスキップ
+    return set(v.strip() for v in vals[1:] if v.strip())
 
 
-# ── ジャンル抽選 ─────────────────────────────────────────────
+# ── ジャンル抽選 ──────────────────────────────────────────────
 
 def select_genre(genres):
     total = sum(g["weight"] for g in genres)
@@ -120,11 +135,10 @@ def select_genre(genres):
     return genres[-1]["name"]
 
 
-# ── Gemini 呼び出し ──────────────────────────────────────────
+# ── Gemini 呼び出し ───────────────────────────────────────────
 
 def build_prompt(template, genre, count):
-    p = template.replace("{GENRE}", genre).replace("{COUNT}", str(count))
-    return p
+    return template.replace("{GENRE}", genre).replace("{COUNT}", str(count))
 
 def call_gemini(api_key, prompt_text):
     genai.configure(api_key=api_key)
@@ -140,13 +154,17 @@ def parse_tsv(raw_text):
     return list(reader)
 
 
-# ── スプシ書き込み ───────────────────────────────────────────
+# ── スプシ書き込み ────────────────────────────────────────────
 
 def append_rows(post_ws, dedup_ws, tsv_rows, platform, used_ids, config):
-    text_col    = PLATFORM_TEXT_COL[platform]
-    max_tags    = config.get("max_hashtags", 3)
-    added       = 0
-    new_ids     = []
+    """
+    1. ネタ帳(dedup)に全列データを保存
+    2. 投稿タブにテキスト（+ハッシュタグ）を書き込み
+    """
+    text_col  = PLATFORM_TEXT_COL[platform]
+    max_tags  = config.get("max_hashtags", 3)
+    now_str   = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+    added     = 0
 
     for row in tsv_rows:
         sid = row.get("source_id", "").strip()
@@ -157,36 +175,57 @@ def append_rows(post_ws, dedup_ws, tsv_rows, platform, used_ids, config):
         if not text:
             continue
 
-        # ハッシュタグを末尾付与（上位 max_tags 件）
+        # ── ネタ帳に全データ保存 ──
+        dedup_row = [
+            sid,                                    # id（source_idを流用）
+            row.get("created_at", now_str),         # created_at
+            row.get("platform", ""),                # platform
+            row.get("genre", ""),                   # genre
+            row.get("source_account", ""),          # source_account
+            row.get("source_url", ""),              # source_url
+            sid,                                    # source_id
+            row.get("original_text", ""),           # original_text
+            row.get("media_urls", ""),              # media_urls
+            row.get("media_alt_text", ""),          # media_alt_text
+            row.get("keywords", ""),                # keywords
+            row.get("tone_notes", ""),              # tone_notes
+            row.get("rewrite_general", ""),         # rewrite_general
+            row.get("compose_x", ""),               # compose_x
+            row.get("compose_threads", ""),         # compose_threads
+            row.get("compose_note_title", ""),      # compose_note_title
+            row.get("compose_note_body_md", ""),    # compose_note_body_md
+            row.get("hashtags", ""),                # hashtags
+            "",                                     # mentions（空固定）
+            row.get("ocr_text", ""),                # ocr_text
+            row.get("ocr_json", ""),                # ocr_json
+            "DRAFT",                                # status
+            "",                                     # scheduled_at
+            "",                                     # posted_url
+            "",                                     # reviewer
+            row.get("notes", ""),                   # notes
+            "",                                     # reviewed
+        ]
+        dedup_ws.append_row(dedup_row, value_input_option="RAW")
+        used_ids.add(sid)
+        time.sleep(0.5)
+
+        # ── 投稿タブにテキスト書き込み ──
         raw_tags = row.get("hashtags", "").strip()
         if raw_tags:
             tags = [t.strip() for t in raw_tags.split(",") if t.strip()][:max_tags]
             if tags:
                 text = text + "\n\n" + " ".join(tags)
 
-        alt_text = row.get("media_alt_text", "").strip()
-
-        sheet_row = [
-            text, "", alt_text, "", "", "", "",  # text〜location_id
-            "",   "", "",                         # status, posted_at, error
-        ]
-        post_ws.append_row(sheet_row, value_input_option="RAW")
-        used_ids.add(sid)
-        new_ids.append(sid)
+        alt_text  = row.get("media_alt_text", "").strip()
+        post_row  = [text, "", alt_text, "", "", "", "", "", "", ""]
+        post_ws.append_row(post_row, value_input_option="RAW")
         added += 1
-        time.sleep(0.6)  # Sheets API レートリミット対策
-
-    # 重複管理タブに source_id を記録
-    if new_ids:
-        now_str = datetime.now(JST).isoformat(timespec="seconds")
-        for sid in new_ids:
-            dedup_ws.append_row([sid, now_str], value_input_option="RAW")
-            time.sleep(0.3)
+        time.sleep(0.5)
 
     return added
 
 
-# ── Discord 通知 ─────────────────────────────────────────────
+# ── Discord 通知 ──────────────────────────────────────────────
 
 def notify_discord(webhook_url, title, description, is_error=False):
     if not webhook_url:
@@ -199,7 +238,7 @@ def notify_discord(webhook_url, title, description, is_error=False):
         pass
 
 
-# ── メイン ───────────────────────────────────────────────────
+# ── メイン ────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
@@ -215,7 +254,7 @@ def main():
 
     post_ws, dedup_ws = open_sheets(config)
 
-    # 閾値計算: posts_per_day × threshold_days
+    # 閾値: posts_per_day × threshold_days
     threshold = config.get("posts_per_day", 8) * config.get("threshold_days", 7)
     pending   = count_pending(post_ws)
     print(f"[INFO] pending={pending}, threshold={threshold}", flush=True)
@@ -233,13 +272,13 @@ def main():
         notify_discord(discord_url, "❌ 収集エラー", f"{account_name}: {msg}", is_error=True)
         sys.exit(1)
 
-    template     = load_prompt()
-    genres       = config.get("genres", [{"name": "ライバー", "weight": 100}])
+    template      = load_prompt()
+    genres        = config.get("genres", [{"name": "ライバー", "weight": 100}])
     posts_per_run = config.get("posts_per_run", 50)
-    batch_size   = 10
-    batches      = (posts_per_run + batch_size - 1) // batch_size
-    used_ids     = get_used_ids(dedup_ws)
-    total_added  = 0
+    batch_size    = 10
+    batches       = (posts_per_run + batch_size - 1) // batch_size
+    used_ids      = get_used_ids(dedup_ws)
+    total_added   = 0
 
     for i in range(batches):
         genre  = select_genre(genres)
@@ -256,7 +295,8 @@ def main():
         except Exception as e:
             msg = f"batch {i+1} エラー: {e}"
             print(f"[ERROR] {msg}", flush=True)
-            notify_discord(discord_url, "❌ 収集エラー", f"{account_name}/{args.platform}: {msg}", is_error=True)
+            notify_discord(discord_url, "❌ 収集エラー",
+                           f"{account_name}/{args.platform}: {msg}", is_error=True)
 
         if i < batches - 1:
             time.sleep(4)

@@ -1,9 +1,12 @@
 {
   "account_name": "夜職",
   "sheet_tab": "auto-posttab",
-  "dedup_tab": "収集投稿",
+  "dedup_tab": "dedup",
   "genres": [
-    {"name": "夜職", "weight": 100}
+    {
+      "name": "夜職",
+      "weight": 100
+    }
   ],
   "posts_per_day": 4,
   "threshold_days": 7,
