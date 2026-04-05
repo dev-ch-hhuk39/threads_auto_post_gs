@@ -142,9 +142,23 @@ def build_prompt(template, genre, count):
 
 def call_gemini(api_key, prompt_text):
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-2.0-flash")
-    resp = model.generate_content(prompt_text)
-    return resp.text
+    # gemini-1.5-flash: 無料枠が最も安定（15RPM / 1500RPD）
+    # 失敗時は gemini-1.5-flash-8b にフォールバック
+    for model_name in ["gemini-1.5-flash", "gemini-1.5-flash-8b"]:
+        for attempt in range(3):
+            try:
+                model = genai.GenerativeModel(model_name)
+                resp  = model.generate_content(prompt_text)
+                return resp.text
+            except Exception as e:
+                err = str(e)
+                if "429" in err:
+                    wait = 65 * (attempt + 1)  # 65s / 130s / 195s
+                    print(f"[WARN] 429 rate limit ({model_name}) attempt {attempt+1}/3, {wait}s待機", flush=True)
+                    time.sleep(wait)
+                else:
+                    raise  # 429以外はすぐ上に投げる
+    raise RuntimeError(f"Gemini 全モデルで429が続きました")
 
 def parse_tsv(raw_text):
     """コードブロック内の TSV を抽出してパース"""
