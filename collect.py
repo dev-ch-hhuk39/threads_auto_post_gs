@@ -11,7 +11,6 @@ from datetime import datetime, timezone, timedelta
 
 import requests
 import gspread
-import google.generativeai as genai
 
 JST = timezone(timedelta(hours=9))
 
@@ -141,24 +140,48 @@ def build_prompt(template, genre, count):
     return template.replace("{GENRE}", genre).replace("{COUNT}", str(count))
 
 def call_gemini(api_key, prompt_text):
-    genai.configure(api_key=api_key)
-    # gemini-1.5-flash: 無料枠が最も安定（15RPM / 1500RPD）
-    # 失敗時は gemini-1.5-flash-8b にフォールバック
-    for model_name in ["gemini-1.5-flash", "gemini-1.5-flash-8b"]:
+    """Gemini REST API を直接呼び出す（SDKのバージョン問題を回避）"""
+    # 試すモデルの順番（無料枠が安定しているものから）
+    models = [
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-8b",
+        "gemini-2.0-flash-lite",
+    ]
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "contents": [{"parts": [{"text": prompt_text}]}],
+        "generationConfig": {"temperature": 0.9, "maxOutputTokens": 8192},
+    }
+
+    for model_name in models:
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models"
+            f"/{model_name}:generateContent"
+        )
         for attempt in range(3):
             try:
-                model = genai.GenerativeModel(model_name)
-                resp  = model.generate_content(prompt_text)
-                return resp.text
-            except Exception as e:
-                err = str(e)
-                if "429" in err:
+                resp = requests.post(
+                    url, headers=headers,
+                    params={"key": api_key},
+                    json=payload, timeout=120,
+                )
+                if resp.status_code == 200:
+                    return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+                elif resp.status_code == 429:
                     wait = 65 * (attempt + 1)  # 65s / 130s / 195s
-                    print(f"[WARN] 429 rate limit ({model_name}) attempt {attempt+1}/3, {wait}s待機", flush=True)
+                    print(f"[WARN] 429 rate limit ({model_name}) {attempt+1}/3, {wait}s待機", flush=True)
                     time.sleep(wait)
+                elif resp.status_code == 404:
+                    print(f"[WARN] 404 model not found: {model_name}, 次のモデルへ", flush=True)
+                    break  # このモデルはスキップ
                 else:
-                    raise  # 429以外はすぐ上に投げる
-    raise RuntimeError(f"Gemini 全モデルで429が続きました")
+                    raise RuntimeError(f"{resp.status_code}: {resp.text[:300]}")
+            except RuntimeError:
+                raise
+            except Exception as e:
+                raise RuntimeError(str(e))
+
+    raise RuntimeError("Gemini: 全モデルで失敗しました")
 
 def parse_tsv(raw_text):
     """コードブロック内の TSV を抽出してパース"""
