@@ -143,13 +143,9 @@ def call_gemini(api_key, prompt_text):
     """Gemini REST API を直接呼び出す。v1/v1beta・複数モデルを自動フォールバック"""
     # (モデル名, APIバージョン) の順番で試す
     candidates = [
-        ("gemini-1.5-flash",        "v1"),
-        ("gemini-1.5-flash",        "v1beta"),
-        ("gemini-1.5-flash-latest", "v1beta"),
-        ("gemini-1.5-flash-8b",     "v1"),
-        ("gemini-1.5-flash-8b",     "v1beta"),
         ("gemini-2.0-flash-lite",   "v1beta"),
         ("gemini-2.0-flash",        "v1beta"),
+        ("gemini-2.0-flash-exp",    "v1beta"),
     ]
     headers = {"Content-Type": "application/json"}
     payload = {
