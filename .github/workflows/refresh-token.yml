@@ -1,0 +1,50 @@
+name: Refresh Threads Token
+
+on:
+  workflow_dispatch: # 手動でのテスト実行用
+  schedule:
+    - cron: '0 0 1 * *'  # 毎月1日のUTC 00:00 (JST 09:00) に自動実行
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          pip install requests
+
+      - name: Fetch new token from Meta API
+        id: fetch_token
+        env:
+          THREADS_ACCESS_TOKEN: ${{ secrets.THREADS_ACCESS_TOKEN }}
+        run: |
+          python refresh_token.py
+
+      - name: Update GitHub Secret
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_SECRETS }}
+          NEW_TOKEN: ${{ steps.fetch_token.outputs.NEW_TOKEN }}
+        run: |
+          echo "::add-mask::$NEW_TOKEN"
+          gh secret set THREADS_ACCESS_TOKEN --body "$NEW_TOKEN"
+          echo "✅ GitHub Secret 'THREADS_ACCESS_TOKEN' を更新しました"
+
+      - name: Discord通知（失敗時）
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -n "$DISCORD_WEBHOOK_URL" ]; then
+            curl -s -X POST "$DISCORD_WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d "{\"embeds\":[{\"title\":\"❌ トークン更新失敗\",\"description\":\"夜職Threadsの自動リフレッシュに失敗しました。早急に確認してください。\",\"color\":16711680}]}"
+          fi
