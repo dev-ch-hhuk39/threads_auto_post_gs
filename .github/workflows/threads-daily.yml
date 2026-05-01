@@ -1,14 +1,11 @@
-name: Threads daily posts
+name: Threads Auto Post (queue from Sheet at 14:00 & 18:00 JST)
 
 on:
   schedule:
-    - cron: '0 9 * * *'    # JST 18:00
-    - cron: '40 11 * * *'  # JST 20:40
-    - cron: '0 15 * * *'   # JST 24:00
-    - cron: '0 17 * * *'   # JST 26:00
+    - cron: "45 4 * * *"   # JST 13:45
+    - cron: "45 8 * * *"   # JST 17:45
   workflow_dispatch:
 
-# 先行ランをキャンセルしない（冗長キャンセル防止）
 concurrency:
   group: threads-auto
   cancel-in-progress: false
@@ -16,16 +13,17 @@ concurrency:
 jobs:
   post:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
     permissions:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
-          python-version: '3.11'
+          python-version: "3.11"
+          cache: "pip"
 
       - name: Install deps
         run: |
@@ -38,7 +36,6 @@ jobs:
           mkdir -p "$HOME/.config/gspread"
           echo "${{ secrets.SA_JSON_BASE64 }}" | base64 -d > "${GITHUB_WORKSPACE}/sa.json"
           install -m 600 "${GITHUB_WORKSPACE}/sa.json" "$HOME/.config/gspread/service_account.json"
-          ls -l "$HOME/.config/gspread"
 
       - name: Create runtime .env
         run: |
@@ -46,27 +43,27 @@ jobs:
           THREADS_USER_ID=${{ secrets.THREADS_USER_ID }}
           THREADS_ACCESS_TOKEN=${{ secrets.THREADS_ACCESS_TOKEN }}
           SHEET_URL=${{ secrets.SHEET_URL }}
-          SHEET_TAB=${{ secrets.SHEET_TAB }}
+          SHEET_ID=${{ secrets.SHEET_ID }}
+          SHEET_TAB=03_投稿キュー
           EOF
 
       - name: Random delay within 30min (skip on manual runs)
         if: github.event_name == 'schedule'
         timeout-minutes: 40
         run: |
-          MAX=$(( RANDOM % 1800 ))   # 0〜1800秒
-          echo "Random wait: ${MAX}s"
-          while [ "$MAX" -gt 0 ]; do
-            CHUNK=$(( MAX>60 ? 60 : MAX ))
-            sleep "$CHUNK"
-            MAX=$(( MAX-CHUNK ))
-          done
+          python - <<'PY'
+          import random
+          import time
+          seconds = random.randint(0, 30 * 60)
+          print(f"[INFO] Sleeping for {seconds} seconds before posting.")
+          time.sleep(seconds)
+          PY
 
-      - name: Post exactly one row (head)
+      - name: Post exactly one queue row
         timeout-minutes: 20
         run: |
           python main_gsheet.py --mode batch --max-per-run 1
 
-# 自動停止を防ぐためのダミーコミット
       - name: Keepalive Workflow
         run: |
           git config --global user.name "GitHub Actions"
