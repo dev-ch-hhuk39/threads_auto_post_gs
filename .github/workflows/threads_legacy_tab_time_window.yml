@@ -1,0 +1,83 @@
+name: Threads Legacy Tab Auto Post (auto-posttab at 13/16/20/24 JST)
+
+on:
+  schedule:
+    - cron: "45 3 * * *"   # JST 12:45
+    - cron: "45 6 * * *"   # JST 15:45
+    - cron: "45 10 * * *"  # JST 19:45
+    - cron: "45 14 * * *"  # JST 23:45
+  workflow_dispatch:
+
+concurrency:
+  group: threads-legacy-tab-auto-post
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      TZ: Asia/Tokyo
+      THREADS_USER_ID: ${{ secrets.THREADS_USER_ID }}
+      THREADS_ACCESS_TOKEN: ${{ secrets.THREADS_ACCESS_TOKEN }}
+      SHEET_URL: ${{ secrets.SHEET_URL }}
+      SHEET_ID: ${{ secrets.SHEET_ID }}
+      SHEET_TAB: auto-posttab
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements.txt
+
+      - name: Restore service account JSON
+        run: |
+          set -eu
+          mkdir -p "$HOME/.config/gspread"
+          echo "${{ secrets.SA_JSON_BASE64 }}" | base64 -d > "${GITHUB_WORKSPACE}/sa.json"
+          install -m 600 "${GITHUB_WORKSPACE}/sa.json" "$HOME/.config/gspread/service_account.json"
+          rm -f "${GITHUB_WORKSPACE}/sa.json"
+
+      - name: Wait random 0-30 minutes for natural timing
+        if: github.event_name == 'schedule'
+        run: |
+          python - <<'PY'
+          import random
+          import time
+          seconds = random.randint(0, 30 * 60)
+          print(f"[INFO] Sleeping for {seconds} seconds before posting.")
+          time.sleep(seconds)
+          PY
+
+      - name: Post 1 item from legacy sheet tab
+        run: |
+          python legacy_tab_autopost.py
+
+      - name: Discord notify on failure
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -n "$DISCORD_WEBHOOK_URL" ]; then
+            curl -s -X POST "$DISCORD_WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d "{\"embeds\":[{\"title\":\"旧Threadsタブ投稿失敗\",\"description\":\"auto-posttab タブの自動投稿でエラーが発生しました。\",\"color\":16711680}]}"
+          fi
+
+      - name: Keepalive Workflow
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          date > last_run.txt
+          git add last_run.txt
+          git commit -m "Auto-update to keep workflow alive" || exit 0
+          git push
