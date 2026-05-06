@@ -129,6 +129,28 @@ def publish_container(user_id: str, token: str, creation_id: str):
     return resp.json()
 
 
+def wait_for_container_ready(token: str, creation_id: str, timeout_seconds=180):
+    deadline = time.time() + timeout_seconds
+    last_payload = {}
+    while time.time() < deadline:
+        resp = requests.get(
+            f"{API_BASE}/{creation_id}",
+            headers=auth_headers(token),
+            params={"fields": "status,error_message"},
+            timeout=30,
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Threads container check failed: {resp.status_code} {resp.text}")
+        last_payload = resp.json()
+        status = str(last_payload.get("status", "")).upper()
+        if status in {"FINISHED", "PUBLISHED"}:
+            return last_payload
+        if status in {"ERROR", "EXPIRED"}:
+            raise RuntimeError(f"Threads container failed: {json.dumps(last_payload, ensure_ascii=False)}")
+        time.sleep(5)
+    raise RuntimeError(f"Threads container was not ready within {timeout_seconds}s: {json.dumps(last_payload, ensure_ascii=False)}")
+
+
 def post_threads(user_id: str, token: str, text: str, media_url: str):
     media_url = (media_url or "").strip()
     if media_url:
@@ -140,6 +162,8 @@ def post_threads(user_id: str, token: str, text: str, media_url: str):
         cid = data.get("id")
         if not cid:
             raise RuntimeError(f"Threads create succeeded but id missing: {json.dumps(data, ensure_ascii=False)}")
+        if payload["media_type"] == "VIDEO":
+            wait_for_container_ready(token, cid)
         publish_container(user_id, token, cid)
         return cid
 

@@ -113,6 +113,28 @@ def publish_container(user_id, token, creation_id):
     return resp.json()
 
 
+def wait_for_container_ready(token, creation_id, timeout_seconds=180):
+    deadline = time.time() + timeout_seconds
+    last_payload = {}
+    while time.time() < deadline:
+        resp = requests.get(
+            f"{API_BASE}/{creation_id}",
+            headers=auth_headers(token),
+            params={"fields": "status,error_message"},
+            timeout=30,
+        )
+        if resp.status_code >= 400:
+            raise Exception(f"HTTP {resp.status_code}: {resp.text}")
+        last_payload = resp.json()
+        status = str(last_payload.get("status", "")).upper()
+        if status in {"FINISHED", "PUBLISHED"}:
+            return last_payload
+        if status in {"ERROR", "EXPIRED"}:
+            raise Exception(f"Threads container failed: {json.dumps(last_payload, ensure_ascii=False)}")
+        time.sleep(5)
+    raise Exception(f"Threads container was not ready within {timeout_seconds}s: {json.dumps(last_payload, ensure_ascii=False)}")
+
+
 def post_one(user_id, token, row):
     text = (row.get("投稿文") or "").strip()
     image_url = (row.get("Threads画像URL") or row.get("画像URL") or "").strip()
@@ -122,6 +144,7 @@ def post_one(user_id, token, row):
         payload = {"media_type": "VIDEO", "video_url": video_url, "text": text}
         data = create_container(user_id, token, payload)
         cid = data.get("id")
+        wait_for_container_ready(token, cid)
         pub = publish_container(user_id, token, cid)
         return {"status": "published", "container_id": cid, "media_type": "VIDEO", "publish": pub}
 
