@@ -103,8 +103,9 @@ def update_result(ws, header, row_idx, status, err=""):
     ws.update_cell(row_idx, col_idx["error"], err[:3000] if status=="failed" else "")
 
 def first_unposted(rows):
+    skip = {"posted", "posted✅", "done", "済", "hold", "rejected", "error", "failed"}
     for (i,r) in rows:
-        if (r.get("status","").strip().lower()!="posted" and (r.get("text") or r.get("image_url"))):
+        if (r.get("text") or r.get("image_url")) and r.get("status","").strip().lower() not in skip:
             return (i,r)
     return None
 

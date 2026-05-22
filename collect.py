@@ -12,6 +12,8 @@ from datetime import datetime, timezone, timedelta
 import requests
 import gspread
 
+from llm_client import call_llm
+
 JST = timezone(timedelta(hours=9))
 
 # 投稿タブのヘッダー（既存スクリプトと共通）
@@ -41,6 +43,10 @@ PLATFORM_TEXT_COL = {
     "threads": "compose_threads",
     "x":       "compose_x",
 }
+
+# 投稿判定用定数
+HUMAN_REVIEW_KEYWORDS = ["転載", "引用", "RT", "コピー", "盗用", "リツイート"]
+PLATFORM_MAX_CHARS    = {"x": 280, "threads": 500}
 
 
 # ── 設定読み込み ──────────────────────────────────────────────
@@ -105,13 +111,13 @@ def open_sheets(config):
 # ── 件数チェック・重複管理 ────────────────────────────────────
 
 def count_pending(ws):
-    """投稿待ち件数を返す（status が posted / done / 済 以外）"""
+    """自動投稿待ち件数を返す（HOLD/REJECTED/エラー行は含まない）"""
     records = ws.get_all_records(default_blank="")
     return sum(
         1 for r in records
         if (r.get("text") or r.get("image_url"))
         and str(r.get("status", "")).strip().lower()
-            not in ("posted", "done", "済", "posted✅")
+            not in ("posted", "done", "済", "posted✅", "hold", "rejected", "error", "failed")
     )
 
 def get_used_ids(dedup_ws):
@@ -134,72 +140,82 @@ def select_genre(genres):
     return genres[-1]["name"]
 
 
-# ── Gemini 呼び出し ───────────────────────────────────────────
+# ── プロンプトビルド ──────────────────────────────────────────
 
 def build_prompt(template, genre, count):
     return template.replace("{GENRE}", genre).replace("{COUNT}", str(count))
 
-def call_gemini(api_key, prompt_text):
-    """Gemini REST API を直接呼び出す。v1/v1beta・複数モデルを自動フォールバック"""
-    # (モデル名, APIバージョン) の順番で試す
-    candidates = [
-        ("gemini-2.0-flash-lite",   "v1beta"),
-        ("gemini-2.0-flash",        "v1beta"),
-        ("gemini-2.0-flash-exp",    "v1beta"),
-    ]
-    headers = {"Content-Type": "application/json"}
-    payload = {
-        "contents": [{"parts": [{"text": prompt_text}]}],
-        "generationConfig": {"temperature": 0.9, "maxOutputTokens": 8192},
-    }
-    last_error = ""
 
-    for model_name, api_ver in candidates:
-        url = (
-            f"https://generativelanguage.googleapis.com/{api_ver}/models"
-            f"/{model_name}:generateContent"
-        )
-        for attempt in range(2):
-            try:
-                resp = requests.post(
-                    url, headers=headers,
-                    params={"key": api_key},
-                    json=payload, timeout=120,
-                )
-                if resp.status_code == 200:
-                    print(f"[OK] モデル使用: {model_name} ({api_ver})", flush=True)
-                    return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-                elif resp.status_code == 429:
-                    wait = 70 * (attempt + 1)
-                    print(f"[WARN] 429 ({model_name}/{api_ver}) {attempt+1}/2, {wait}s待機", flush=True)
-                    time.sleep(wait)
-                    last_error = f"429 rate limit: {model_name}"
-                elif resp.status_code == 404:
-                    last_error = f"404 not found: {model_name}/{api_ver}"
-                    break  # このモデルはスキップ
-                else:
-                    last_error = f"{resp.status_code}: {resp.text[:200]}"
-                    break
-            except Exception as e:
-                last_error = str(e)
-                break
-
-    raise RuntimeError(f"Gemini: 全モデルで失敗しました (最後のエラー: {last_error})")
+# ── TSV パース ────────────────────────────────────────────────
 
 def parse_tsv(raw_text):
-    """コードブロック内の TSV を抽出してパース"""
+    """コードブロック内の TSV を抽出してパース（フィールド内改行に対応）"""
     m = re.search(r"```(?:text|tsv)?\n(.*?)```", raw_text, re.DOTALL)
     tsv_str = m.group(1) if m else raw_text
-    reader = csv.DictReader(io.StringIO(tsv_str.strip()), delimiter="\t")
+    lines = tsv_str.strip().splitlines()
+    if not lines:
+        return []
+    header = lines[0]
+    expected_cols = len(header.split("\t"))
+    merged = [header]
+    buf = ""
+    for line in lines[1:]:
+        buf = (buf + "\\n" + line) if buf else line
+        if len(buf.split("\t")) >= expected_cols:
+            merged.append(buf)
+            buf = ""
+    if buf:
+        merged.append(buf)
+    reader = csv.DictReader(io.StringIO("\n".join(merged)), delimiter="\t")
     return list(reader)
+
+
+# ── 投稿判定 ──────────────────────────────────────────────────
+
+def classify_post(row, platform, used_ids):
+    """
+    戻り値: ("AUTO_POST" | "HUMAN_REVIEW" | "REJECT", reason_str)
+    """
+    text_col  = PLATFORM_TEXT_COL[platform]
+    text      = row.get(text_col, "").strip().replace("\\n", "\n")
+    source_id = row.get("source_id", "").strip()
+
+    # REJECT 条件
+    if not text:
+        return "REJECT", "テキスト空"
+    if not source_id or source_id in used_ids:
+        return "REJECT", "重複または source_id なし"
+    if len(text) < 5:
+        return "REJECT", "テキストが短すぎる（生成失敗の可能性）"
+    max_chars = PLATFORM_MAX_CHARS.get(platform, 280)
+    if len(text) > max_chars:
+        return "REJECT", f"文字数オーバー ({len(text)} > {max_chars})"
+    if re.search(r'\{[A-Z_]+\}', text):
+        return "REJECT", "プレースホルダー未置換"
+
+    # HUMAN_REVIEW 条件
+    if "@" in text:
+        return "HUMAN_REVIEW", "メンション含む"
+    if "http" in text:
+        return "HUMAN_REVIEW", "URL含む"
+    if any(kw in text for kw in HUMAN_REVIEW_KEYWORDS):
+        return "HUMAN_REVIEW", "注意語句含む"
+    if row.get("image_url", "").strip():
+        return "HUMAN_REVIEW", "画像URL付き"
+    if len(text) < 15:
+        return "HUMAN_REVIEW", "テキストが短い（要確認）"
+
+    return "AUTO_POST", ""
 
 
 # ── スプシ書き込み ────────────────────────────────────────────
 
 def append_rows(post_ws, dedup_ws, tsv_rows, platform, used_ids, config):
     """
-    1. ネタ帳(dedup)に全列データを保存
-    2. 投稿タブにテキスト（+ハッシュタグ）を書き込み
+    1. classify_post() で AUTO_POST / HUMAN_REVIEW / REJECT を判定
+    2. REJECT はスキップ（dedup・投稿タブともに追加しない）
+    3. HUMAN_REVIEW は投稿タブに status=HOLD で追加（人間確認後に空欄にすれば投稿）
+    4. AUTO_POST は投稿タブに status=空で追加（auto_post.py が自動投稿）
     """
     text_col  = PLATFORM_TEXT_COL[platform]
     max_tags  = config.get("max_hashtags", 3)
@@ -207,13 +223,14 @@ def append_rows(post_ws, dedup_ws, tsv_rows, platform, used_ids, config):
     added     = 0
 
     for row in tsv_rows:
-        sid = row.get("source_id", "").strip()
-        if not sid or sid in used_ids:
+        decision, reason = classify_post(row, platform, used_ids)
+
+        if decision == "REJECT":
+            print(f"[REJECT] source_id={row.get('source_id', '')} reason={reason}", flush=True)
             continue
 
-        text = row.get(text_col, "").strip()
-        if not text:
-            continue
+        sid  = row.get("source_id", "").strip()
+        text = row.get(text_col, "").strip().replace("\\n", "\n")
 
         # ── ネタ帳に全データ保存 ──
         dedup_row = [
@@ -256,11 +273,15 @@ def append_rows(post_ws, dedup_ws, tsv_rows, platform, used_ids, config):
             if tags:
                 text = text + "\n\n" + " ".join(tags)
 
-        alt_text  = row.get("media_alt_text", "").strip()
-        post_row  = [text, "", alt_text, "", "", "", "", "", "", ""]
+        alt_text    = row.get("media_alt_text", "").strip()
+        post_status = "HOLD" if decision == "HUMAN_REVIEW" else ""
+        post_row    = [text, "", alt_text, "", "", "", "", post_status, "", ""]
         post_ws.append_row(post_row, value_input_option="RAW")
         added += 1
         time.sleep(0.5)
+
+        if decision == "HUMAN_REVIEW":
+            print(f"[HOLD] source_id={sid} reason={reason}", flush=True)
 
     return added
 
@@ -288,9 +309,16 @@ def main():
     args = parser.parse_args()
 
     config       = load_config()
-    gemini_key   = os.environ.get("GEMINI_API_KEY", "").strip()
     discord_url  = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
     account_name = config.get("account_name", "")
+
+    # Gemini使用時はAPIキーを事前確認（Ollama使用時はスキップ）
+    if os.environ.get("LLM_PROVIDER", "gemini").strip().lower() != "ollama":
+        if not os.environ.get("GEMINI_API_KEY", "").strip():
+            msg = "GEMINI_API_KEY が未設定です"
+            print(f"[ERROR] {msg}", flush=True)
+            notify_discord(discord_url, "❌ 収集エラー", f"{account_name}: {msg}", is_error=True)
+            sys.exit(1)
 
     post_ws, dedup_ws = open_sheets(config)
 
@@ -307,11 +335,6 @@ def main():
         print(f"[CHECK] {config.get('posts_per_run', 50)} 件生成が必要", flush=True)
         return
 
-    if not gemini_key:
-        msg = "GEMINI_API_KEY が未設定です"
-        notify_discord(discord_url, "❌ 収集エラー", f"{account_name}: {msg}", is_error=True)
-        sys.exit(1)
-
     template      = load_prompt()
     genres        = config.get("genres", [{"name": "ライバー", "weight": 100}])
     posts_per_run = config.get("posts_per_run", 50)
@@ -327,7 +350,7 @@ def main():
 
         print(f"[GEN] batch {i+1}/{batches} genre={genre} count={count}", flush=True)
         try:
-            raw  = call_gemini(gemini_key, prompt)
+            raw  = call_llm(prompt)
             rows = parse_tsv(raw)
             n    = append_rows(post_ws, dedup_ws, rows, args.platform, used_ids, config)
             total_added += n
